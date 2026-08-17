@@ -9,6 +9,53 @@ A simple CRM-style API server for managing contacts and files. Available in both
 
 Both implementations share the same SQLite database schema and provide identical REST API endpoints.
 
+## How to review this repo
+
+The **rate limiter** is the feature to review. It was built AI-assisted but with a deliberate,
+auditable process — **design first, then test-first (red→green), one small commit per step** —
+so there's more written material than a typical change. That's intentional: the docs are the
+reasoning, and the git history is the receipt. You don't need to read everything; here's the
+short path.
+
+**Recommended reading order (≈15 min):**
+
+1. **[`docs/rate-limiter-plan.md`](docs/rate-limiter-plan.md)** — the design. What we built and
+   *why*: the leaky-bucket algorithm, the exact "10/min" guarantee (and its honest caveats), the
+   `RateLimiter` interface, and where it plugs into the request pipeline. Start here.
+2. **[`docs/architecture-go.md`](docs/architecture-go.md)** — how the existing Go server is wired
+   and the one seam the limiter hooks into. (Diagrams render inline on GitHub.)
+3. **The code** — small and self-contained under
+   [`go/internal/ratelimit/`](go/internal/ratelimit/): `ratelimit.go` (the interface),
+   `leakybucket.go`, `slidingwindow.go`, `middleware.go`, `factory.go`, and the tests in
+   `ratelimit_test.go`; plus the wiring in `go/internal/app/app.go` and the HTTP tests in
+   `go/internal/app/app_test.go`.
+4. **[`docs/TASKS.md`](docs/TASKS.md)** — the build log: every test we wrote, the change that
+   made it pass, and the findings from an adversarial code-review pass (and how each was fixed).
+   Read this to see *how* the code came to exist, commit by commit.
+
+**Where to find what:**
+
+| Looking for… | Go there |
+|--------------|----------|
+| Why it's designed this way | `docs/rate-limiter-plan.md` |
+| The limiter code | `go/internal/ratelimit/` |
+| How it's wired into the API | `go/internal/app/app.go` (the `/api` middleware) |
+| The tests | `go/internal/ratelimit/ratelimit_test.go`, `go/internal/app/app_test.go` |
+| The commit-by-commit story + review findings | `docs/TASKS.md` |
+| The test strategy (unit / integration / e2e / mutation) and *why* each exists | `docs/testing.md` |
+| Tradeoffs made & future work | `docs/design-tradeoffs.md` |
+| Onboarding for an AI assistant | `CLAUDE.md` |
+
+**A note on the process:** commits are grouped one-per-task and tell the story (`T1…T15` = the
+feature, `F1…F5` = adversarial-review fixes, `G1…G3` = consistency cleanups). Reading the
+history top-to-bottom shows each test appearing with the code that satisfies it.
+
+**Diagrams** are inline [Mermaid](https://mermaid.js.org/) — they render directly on GitHub. To
+view them locally, run **`make diagrams`** (renders to SVG, opens a browser gallery; needs
+Node/`npx`, no editor extension). Optional VS Code inline preview: `make setup` installs the
+`bierner.markdown-mermaid` extension (`Cmd+Shift+V`); if it renders blank under a dark theme, use
+`make diagrams`.
+
 ## Quick Start
 
 ### Go
@@ -54,6 +101,31 @@ curl -H "Authorization: Bearer user@example.com" http://localhost:8080/api/conta
 ```
 
 The token should be a valid email address. It serves as the user identifier.
+
+## Rate Limiting
+
+The server applies a **process-local, global** rate limit — **10 requests per minute across all
+clients combined** — to `/api/*`. `/health` is exempt, and the limiter runs *before*
+authentication, so unauthenticated requests count too.
+
+Exceeding the limit returns **HTTP 429** with a JSON `{"error": ...}` body and a `Retry-After`
+header. Every `/api` response also carries `RateLimit-Limit` / `RateLimit-Remaining` (and
+`RateLimit-Reset` on a 429).
+
+```bash
+# The 11th call within a minute returns 429.
+for i in $(seq 1 11); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -H "Authorization: Bearer user@example.com" http://localhost:8080/api/contacts
+done
+```
+
+The default algorithm is a leaky bucket, which *smooths* rather than enforcing a strict window
+(it allows a burst of 10, then refills ~1 slot every 6s). A strict sliding-window log is also
+available — see [Configuration](#configuration) to switch, and
+[`docs/rate-limiter-plan.md`](docs/rate-limiter-plan.md) for the design and tradeoffs.
+
+> Implemented in the Go server. The Java server does not yet include the limiter.
 
 ## Endpoints
 
@@ -180,6 +252,19 @@ make bench
 | `--seed` | `false` | Seed database with test data |
 | `--contacts` | `10000` | Number of contacts to seed |
 | `--files` | `20` | Number of files to seed |
+
+The rate limiter is configured in `go/cmd/server/main.go` — its limit, period, and algorithm:
+
+```go
+ratelimit.New(ratelimit.Config{
+    Algorithm: ratelimit.AlgorithmLeakyBucket, // or AlgorithmSlidingWindowLog for a strict window
+    Limit:     10,
+    Period:    time.Minute,
+}, time.Now)
+```
+
+Switching `Algorithm` is the only change needed — the middleware depends on the
+`ratelimit.RateLimiter` interface, not the concrete strategy.
 
 ### Java
 
